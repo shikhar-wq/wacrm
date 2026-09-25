@@ -99,6 +99,30 @@ interface MetaStatusError {
   href?: string
 }
 
+interface WhatsAppMessageEcho extends WhatsAppMessage {
+  /** Recipient customer phone number when sent from WhatsApp Business App (Coexistence) */
+  to?: string
+  /** Recipient customer BSUID when sent from WhatsApp Business App (Coexistence) */
+  to_user_id?: string
+}
+
+interface WhatsAppHistoryChunk {
+  metadata?: {
+    phase?: number
+    chunk_order?: number
+    progress?: number
+  }
+  threads?: Array<{
+    id: string
+    messages?: Array<
+      WhatsAppMessage & {
+        to?: string
+        history_context?: { status?: string }
+      }
+    >
+  }>
+}
+
 interface WhatsAppWebhookEntry {
   id: string
   changes: Array<{
@@ -116,6 +140,10 @@ interface WhatsAppWebhookEntry {
         parent_user_id?: string
       }>
       messages?: WhatsAppMessage[]
+      /** Outgoing messages sent from the WhatsApp Business App in Coexistence mode (`smb_message_echoes`) */
+      message_echoes?: WhatsAppMessageEcho[]
+      /** Historical chat threads synced during WhatsApp Business App Coexistence onboarding (`history`) */
+      history?: WhatsAppHistoryChunk[]
       statuses?: Array<{
         id: string
         status: string
@@ -297,10 +325,15 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         }
       }
 
-      // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      // Handle incoming messages, Coexistence message echoes (`smb_message_echoes`), or Coexistence history sync (`history`)
+      const hasInboundMessages = Boolean(value.messages && value.contacts)
+      const hasMessageEchoes = Boolean(value.message_echoes && value.message_echoes.length > 0)
+      const hasHistorySync = Boolean(value.history && value.history.length > 0)
 
-      const phoneNumberId = value.metadata.phone_number_id
+      if (!hasInboundMessages && !hasMessageEchoes && !hasHistorySync) continue
+
+      const phoneNumberId = value.metadata?.phone_number_id
+      if (!phoneNumberId) continue
 
       // Find user's config by phone_number_id. `.single()` returns
       // PGRST116 for both 0 rows AND ≥2 rows — distinguish them so
@@ -340,28 +373,237 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       const config = configRows[0]
 
       const decryptedAccessToken = decrypt(config.access_token)
+      const mirrorMedia = config.mirror_inbound_media !== false
 
-      for (let i = 0; i < value.messages.length; i++) {
-        const message = value.messages[i]
-        const contact = value.contacts[i] || value.contacts[0]
+      if (hasInboundMessages && value.messages && value.contacts) {
+        for (let i = 0; i < value.messages.length; i++) {
+          const message = value.messages[i]
+          const contact = value.contacts[i] || value.contacts[0]
 
-        await processMessage(
-          message,
-          contact,
-          // Tenancy — drives every contact / conversation lookup
-          // and the engines' active-row dispatch.
-          config.account_id,
-          // Audit / sender-of-record — used as the user_id on row
-          // inserts that need it for NOT NULL FK compliance. Always
-          // the admin who saved the WhatsApp config.
-          config.user_id,
-          decryptedAccessToken,
-          // Default ON: the column is NOT NULL DEFAULT TRUE, but a row
-          // read before migration 039 lands would have it undefined,
-          // and losing attachments is the failure mode worth avoiding.
-          config.mirror_inbound_media !== false
-        )
+          await processMessage(
+            message,
+            contact,
+            // Tenancy — drives every contact / conversation lookup
+            // and the engines' active-row dispatch.
+            config.account_id,
+            // Audit / sender-of-record — used as the user_id on row
+            // inserts that need it for NOT NULL FK compliance. Always
+            // the admin who saved the WhatsApp config.
+            config.user_id,
+            decryptedAccessToken,
+            // Default ON: the column is NOT NULL DEFAULT TRUE, but a row
+            // read before migration 039 lands would have it undefined,
+            // and losing attachments is the failure mode worth avoiding.
+            mirrorMedia
+          )
+        }
       }
+
+      // Handle WhatsApp Business App Coexistence outgoing echoes (`smb_message_echoes`)
+      if (hasMessageEchoes && value.message_echoes) {
+        for (const echo of value.message_echoes) {
+          await processMessageEcho(
+            echo,
+            config.account_id,
+            config.user_id,
+            decryptedAccessToken,
+            mirrorMedia
+          )
+        }
+      }
+
+      // Handle WhatsApp Business App Coexistence historical chat sync (`history`)
+      if (hasHistorySync && value.history) {
+        for (const chunk of value.history) {
+          await processHistorySync(
+            chunk,
+            config.account_id,
+            config.user_id,
+            decryptedAccessToken,
+            mirrorMedia
+          )
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Process an outgoing message sent from the WhatsApp Business mobile/companion app
+ * when WhatsApp Coexistence (`smb_message_echoes`) is active.
+ * Syncs the message into the CRM conversation as an outbound ('agent') message.
+ */
+async function processMessageEcho(
+  echo: WhatsAppMessageEcho,
+  accountId: string,
+  configOwnerUserId: string,
+  accessToken: string,
+  mirrorMedia: boolean
+) {
+  const identity = resolveInboundIdentity(
+    {
+      from: echo.to,
+      from_user_id: echo.to_user_id,
+    },
+    undefined
+  )
+  if (!hasUsableIdentity(identity)) {
+    console.warn('[webhook] smb_message_echo missing recipient phone/BSUID; skipping:', echo.id)
+    return
+  }
+
+  const contactOutcome = await findOrCreateContact(accountId, configOwnerUserId, identity)
+  if (!contactOutcome) return
+  const contactRecord = contactOutcome.contact
+
+  const convResult = await findOrCreateConversation(accountId, configOwnerUserId, contactRecord.id)
+  if (!convResult) return
+  const conversation = convResult.conversation
+
+  const { contentText, mediaUrl, mediaType } = await parseMessageContent(
+    echo,
+    accessToken,
+    mirrorMedia ? { accountId } : null
+  )
+
+  const ALLOWED_CONTENT_TYPES = new Set([
+    'text', 'image', 'document', 'audio', 'video',
+    'location', 'template', 'interactive',
+  ])
+  const contentType = ALLOWED_CONTENT_TYPES.has(echo.type)
+    ? echo.type
+    : echo.type === 'sticker'
+      ? 'image'
+      : 'text'
+
+  const createdAtIso = echo.timestamp
+    ? new Date(parseInt(echo.timestamp) * 1000).toISOString()
+    : new Date().toISOString()
+
+  const { data: insertedRows, error: msgError } = await supabaseAdmin()
+    .from('messages')
+    .upsert(
+      {
+        conversation_id: conversation.id,
+        sender_type: 'agent',
+        sender_id: configOwnerUserId,
+        content_type: contentType,
+        content_text: contentText,
+        media_url: mediaUrl,
+        media_type: mediaType,
+        message_id: echo.id,
+        status: 'sent',
+        created_at: createdAtIso,
+      },
+      { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
+    )
+    .select('id')
+
+  if (msgError) {
+    console.error('[webhook] Error inserting smb_message_echo:', msgError)
+    return
+  }
+
+  if (!insertedRows || insertedRows.length === 0) return
+
+  await supabaseAdmin()
+    .from('conversations')
+    .update({
+      last_message_text: contentText || `[${echo.type}]`,
+      last_message_at: createdAtIso,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversation.id)
+}
+
+/**
+ * Process historical chat threads delivered by Meta during WhatsApp Business App
+ * Coexistence onboarding (`history` webhook field).
+ */
+async function processHistorySync(
+  chunk: WhatsAppHistoryChunk,
+  accountId: string,
+  configOwnerUserId: string,
+  accessToken: string,
+  mirrorMedia: boolean
+) {
+  if (!chunk.threads || chunk.threads.length === 0) return
+
+  for (const thread of chunk.threads) {
+    if (!thread.id || !thread.messages || thread.messages.length === 0) continue
+
+    const identity = resolveInboundIdentity({ from: thread.id }, undefined)
+    if (!hasUsableIdentity(identity)) continue
+
+    const contactOutcome = await findOrCreateContact(accountId, configOwnerUserId, identity)
+    if (!contactOutcome) continue
+    const contactRecord = contactOutcome.contact
+
+    const convResult = await findOrCreateConversation(accountId, configOwnerUserId, contactRecord.id)
+    if (!convResult) continue
+    const conversation = convResult.conversation
+
+    const normalizedCustomerPhone = normalizePhone(thread.id)
+    let latestTimestampMs = 0
+    let latestMessageText = ''
+
+    for (const histMsg of thread.messages) {
+      const isFromCustomer =
+        histMsg.from && normalizePhone(histMsg.from) === normalizedCustomerPhone
+      const senderType = isFromCustomer ? 'customer' : 'agent'
+
+      const { contentText, mediaUrl, mediaType } = await parseMessageContent(
+        histMsg,
+        accessToken,
+        mirrorMedia ? { accountId } : null
+      )
+
+      const ALLOWED_CONTENT_TYPES = new Set([
+        'text', 'image', 'document', 'audio', 'video',
+        'location', 'template', 'interactive',
+      ])
+      const contentType = ALLOWED_CONTENT_TYPES.has(histMsg.type)
+        ? histMsg.type
+        : histMsg.type === 'sticker'
+          ? 'image'
+          : 'text'
+
+      const tsMs = histMsg.timestamp ? parseInt(histMsg.timestamp) * 1000 : Date.now()
+      const createdAtIso = new Date(tsMs).toISOString()
+
+      await supabaseAdmin()
+        .from('messages')
+        .upsert(
+          {
+            conversation_id: conversation.id,
+            sender_type: senderType,
+            sender_id: senderType === 'agent' ? configOwnerUserId : null,
+            content_type: contentType,
+            content_text: contentText,
+            media_url: mediaUrl,
+            media_type: mediaType,
+            message_id: histMsg.id,
+            status: 'delivered',
+            created_at: createdAtIso,
+          },
+          { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
+        )
+
+      if (tsMs >= latestTimestampMs) {
+        latestTimestampMs = tsMs
+        latestMessageText = contentText || `[${histMsg.type}]`
+      }
+    }
+
+    if (latestTimestampMs > 0) {
+      await supabaseAdmin()
+        .from('conversations')
+        .update({
+          last_message_text: latestMessageText,
+          last_message_at: new Date(latestTimestampMs).toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', conversation.id)
     }
   }
 }

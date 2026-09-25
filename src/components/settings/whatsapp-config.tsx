@@ -24,6 +24,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Switch } from '@/components/ui/switch';
 import { SettingsPanelHead } from './settings-panel-head';
+import { CoexistenceOnboarding } from './coexistence-onboarding';
 import {
   Accordion,
   AccordionItem,
@@ -724,6 +725,14 @@ export function WhatsAppConfig() {
             )}
           </Alert>
         )}
+
+        {/* WhatsApp Business App Coexistence Onboarding (QR Code via Embedded Signup) */}
+        <CoexistenceOnboarding
+          onIdsReceived={({ phoneNumberId: newPhoneId, wabaId: newWabaId }) => {
+            if (newPhoneId) setPhoneNumberId(newPhoneId);
+            if (newWabaId) setWabaId(newWabaId);
+          }}
+        />
 
         {/* API Credentials */}
         <Card>

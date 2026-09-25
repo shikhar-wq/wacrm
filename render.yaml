@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: wacrm
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    healthCheckPath: /login
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_APP_LOCALE
+        value: en
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_APP_ID
+        sync: false
+      - key: NEXT_PUBLIC_META_APP_ID
+        sync: false
+      - key: NEXT_PUBLIC_META_CONFIG_ID
+        sync: false
+      - key: NEXT_PUBLIC_SITE_URL
+        sync: false
